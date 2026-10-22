@@ -1,0 +1,17 @@
+# Local runtime settings and reference audio must never be published.
+settings.json
+audio/
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.opus
+*.webm
+
+# Build and runtime artifacts.
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

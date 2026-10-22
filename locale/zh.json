@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "朗读对话",
+    "description": "用本地 GPT-SoVITS 和自定义参考语音朗读助手回复。"
+  }
+}

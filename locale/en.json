@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Read Aloud",
+    "description": "Read assistant replies aloud with a local GPT-SoVITS voice and a configurable reference voice."
+  }
+}
