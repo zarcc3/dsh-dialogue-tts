@@ -55,10 +55,11 @@ window.__ModuleLoader__.load({
       formInvalid: '请先修正表单中的错误',
       actionRead: '朗读这条回复',
       actionSynthesizing: '正在合成语音，点击取消',
+      actionSynthesizingSegment: '正在合成第 {current}/{total} 段，点击取消',
+      actionSegment: '第 {current}/{total} 段',
       actionStop: '停止朗读',
       actionRetry: '朗读失败，点击重试',
       actionNoText: '这条回复没有可朗读的文本',
-      actionLong: '内容较长，仅朗读前 4000 字',
       errorNotConfigured: '请先在“设置 → 朗读对话”中配置参考语音',
       errorUnreachable: '无法连接 GPT-SoVITS，请确认服务已启动',
       errorRefMissing: '参考音频文件不存在，请检查路径',
@@ -112,10 +113,11 @@ window.__ModuleLoader__.load({
       formInvalid: 'Fix the form errors first',
       actionRead: 'Read this reply aloud',
       actionSynthesizing: 'Synthesizing speech; click to cancel',
+      actionSynthesizingSegment: 'Synthesizing segment {current}/{total}; click to cancel',
+      actionSegment: 'Segment {current}/{total}',
       actionStop: 'Stop reading',
       actionRetry: 'Reading failed; click to retry',
       actionNoText: 'This reply has no readable text',
-      actionLong: 'Long reply; reading the first 4,000 characters',
       errorNotConfigured: 'Configure a reference voice in Settings → Read Aloud first',
       errorUnreachable: 'Cannot reach GPT-SoVITS. Make sure the service is running.',
       errorRefMissing: 'The reference audio file is missing; check the path',
@@ -502,28 +504,63 @@ window.__ModuleLoader__.load({
         .replace(/[ \t]+/g, ' ')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
-      if (text.length > 4000) {
-        const head = text.slice(0, 4000);
-        const stop = Math.max(
-          head.lastIndexOf('。'),
-          head.lastIndexOf('！'),
-          head.lastIndexOf('？'),
-          head.lastIndexOf('.'),
-          head.lastIndexOf('\n'),
-        );
-        text = (stop > 3200 ? head.slice(0, stop + 1) : head).trim();
-      }
       return text;
+    }
+
+    /**
+     * Split cleaned speech into request-sized pieces, preferring sentence ends.
+     * The 600-character default keeps each GPT-SoVITS request small enough to
+     * start playing while the following piece is synthesized.
+     */
+    function splitSpeechText(text, maxChars = 600) {
+      const source = typeof text === 'string' ? text.trim() : '';
+      if (!source) return [];
+      if (source.length <= maxChars) return [source];
+
+      const sentenceEnd = new Set(['。', '！', '？', '!', '?', '；', ';', '\n']);
+      const softBreak = new Set([',', '，', '、', ' ']);
+      const chunks = [];
+      let rest = source;
+
+      while (rest.length > maxChars) {
+        const window = rest.slice(0, maxChars);
+        const floor = Math.floor(maxChars * 0.55);
+        let cut = -1;
+
+        for (let index = window.length - 1; index >= floor; index -= 1) {
+          if (sentenceEnd.has(window[index])) {
+            cut = index + 1;
+            break;
+          }
+        }
+        if (cut < 0) {
+          for (let index = window.length - 1; index >= floor; index -= 1) {
+            if (softBreak.has(window[index])) {
+              cut = index + 1;
+              break;
+            }
+          }
+        }
+        if (cut < 0) cut = maxChars;
+
+        const chunk = rest.slice(0, cut).trim();
+        if (chunk) chunks.push(chunk);
+        rest = rest.slice(cut).trim();
+      }
+
+      if (rest) chunks.push(rest);
+      return chunks;
     }
 
     class PlaybackController {
       constructor() {
-        this.state = { status: 'idle', messageId: null, error: null };
+        this.state = { status: 'idle', messageId: null, error: null, segment: null };
         this.listeners = new Set();
         this.audio = null;
-        this.fetchController = null;
+        this.run = null;
         this.token = 0;
         this.cache = new Map();
+        this.cacheLimit = 48;
       }
 
       getState = () => this.state;
@@ -540,29 +577,149 @@ window.__ModuleLoader__.load({
         for (const listener of this.listeners) listener();
       }
 
-      stopAudio() {
-        if (this.audio === null) return;
-        this.audio.pause();
-        this.audio.src = '';
+      cacheKey(messageId, index) {
+        return `${messageId}\u0000${index}`;
+      }
+
+      trimCache() {
+        while (this.cache.size > this.cacheLimit) {
+          const first = this.cache.keys().next();
+          if (first.done) break;
+          const url = this.cache.get(first.value);
+          if (url !== undefined) URL.revokeObjectURL(url);
+          this.cache.delete(first.value);
+        }
+      }
+
+      releaseRun() {
+        const run = this.run;
+        if (run === null) return;
+        run.aborted = true;
+        run.controller.abort();
+        const release = run.release;
+        run.release = null;
+        if (typeof release === 'function') release();
+        this.run = null;
         this.audio = null;
+        this.trimCache();
       }
 
       stop() {
         this.token += 1;
-        this.fetchController?.abort();
-        this.fetchController = null;
-        this.stopAudio();
-        this.publish({ status: 'idle', messageId: null, error: null });
+        this.releaseRun();
+        this.publish({ status: 'idle', messageId: null, error: null, segment: null });
       }
 
-      trimCache(keep) {
-        if (this.cache.size <= 12) return;
-        for (const [id, url] of this.cache) {
-          if (id === keep) continue;
-          URL.revokeObjectURL(url);
-          this.cache.delete(id);
-          if (this.cache.size <= 12) break;
+      async fetchChunk(run, index) {
+        const key = this.cacheKey(run.messageId, index);
+        const cached = this.cache.get(key);
+        if (cached !== undefined) return cached;
+
+        const response = await fetch(`${API_ROOT}tts`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'audio/wav, application/json',
+          },
+          body: JSON.stringify({ text: run.chunks[index] }),
+          signal: run.controller.signal,
+        });
+
+        if (!response.ok) {
+          let code = `http-${response.status}`;
+          let message = `HTTP ${response.status}`;
+          try {
+            const data = await response.json();
+            if (data?.error) {
+              code = data.error.code || code;
+              message = data.error.message || message;
+            }
+          } catch {
+            // Keep the status when the service did not return JSON.
+          }
+          const error = new Error(message);
+          error.code = code;
+          throw error;
         }
+
+        const type = response.headers.get('content-type') ?? '';
+        if (!type.includes('audio') && !type.includes('octet-stream')) {
+          const error = new Error('The read-aloud service returned an unexpected response');
+          error.code = 'tts-failed';
+          throw error;
+        }
+
+        const blob = await response.blob();
+        if (run.aborted || run.token !== this.token) {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          throw error;
+        }
+        if (blob.size === 0) {
+          const error = new Error('The read-aloud service returned empty audio');
+          error.code = 'tts-failed';
+          throw error;
+        }
+
+        const url = URL.createObjectURL(blob);
+        this.cache.set(key, url);
+        return url;
+      }
+
+      playAudio(url, run) {
+        return new Promise((resolve, reject) => {
+          if (run.token !== this.token || run.aborted) {
+            resolve();
+            return;
+          }
+
+          const audio = new Audio(url);
+          this.audio = audio;
+          let settled = false;
+
+          const finish = (error) => {
+            if (settled) return;
+            settled = true;
+            audio.onended = null;
+            audio.onerror = null;
+            if (this.audio === audio) this.audio = null;
+            if (run.release === release) run.release = null;
+            if (error) reject(error);
+            else resolve();
+          };
+
+          const release = () => {
+            try {
+              audio.pause();
+              audio.src = '';
+            } catch {
+              // The element may already be torn down.
+            }
+            finish();
+          };
+
+          run.release = release;
+          audio.onended = () => finish();
+          audio.onerror = () => {
+            const error = new Error('audio playback failed');
+            error.code = 'audio';
+            finish(error);
+          };
+
+          try {
+            audio.play().catch((error) => {
+              const failure = new Error(error?.message ?? String(error));
+              failure.name = error?.name ?? 'Error';
+              failure.code = 'audio';
+              finish(failure);
+            });
+          } catch (error) {
+            const failure = new Error(error?.message ?? String(error));
+            failure.name = error?.name ?? 'Error';
+            failure.code = 'audio';
+            finish(failure);
+          }
+        });
       }
 
       async play(messageId, text) {
@@ -573,117 +730,107 @@ window.__ModuleLoader__.load({
         }
 
         this.token += 1;
+        this.releaseRun();
         const token = this.token;
-        this.fetchController?.abort();
-        this.fetchController = null;
-        this.stopAudio();
 
         if (!text) {
           this.publish({
             status: 'error',
             messageId,
             error: { code: 'empty-text', message: '' },
+            segment: null,
           });
           return;
         }
 
-        const cached = this.cache.get(messageId);
-        if (cached !== undefined) {
-          this.publish({ status: 'loading', messageId, error: null });
-          await this.startAudio(cached, messageId, token);
+        const chunks = splitSpeechText(text);
+        if (chunks.length === 0) {
+          this.publish({
+            status: 'error',
+            messageId,
+            error: { code: 'empty-text', message: '' },
+            segment: null,
+          });
           return;
         }
 
-        this.publish({ status: 'loading', messageId, error: null });
-        const controller = new AbortController();
-        this.fetchController = controller;
+        const run = {
+          token,
+          messageId,
+          chunks,
+          index: 0,
+          controller: new AbortController(),
+          release: null,
+          aborted: false,
+        };
+        this.run = run;
+        this.publish({
+          status: 'loading',
+          messageId,
+          error: null,
+          segment: { index: 1, total: chunks.length },
+        });
+
         try {
-          const response = await fetch(`${API_ROOT}tts`, {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              accept: 'audio/wav, application/json',
-            },
-            body: JSON.stringify({ text }),
-            signal: controller.signal,
-          });
-          if (!response.ok) {
-            let code = `http-${response.status}`;
-            let message = `HTTP ${response.status}`;
-            try {
-              const data = await response.json();
-              if (data?.error) {
-                code = data.error.code || code;
-                message = data.error.message || message;
-              }
-            } catch {
-              // Keep the status when the service did not return JSON.
+          let audioUrl = await this.fetchChunk(run, 0);
+          if (token !== this.token || run.aborted) return;
+
+          for (let index = 0; index < chunks.length; index += 1) {
+            run.index = index;
+            let nextPromise = null;
+            if (index + 1 < chunks.length) {
+              nextPromise = this.fetchChunk(run, index + 1).then(
+                (url) => ({ url }),
+                (error) => ({ error }),
+              );
             }
-            const error = new Error(message);
-            error.code = code;
-            throw error;
+
+            this.publish({
+              status: 'playing',
+              messageId,
+              error: null,
+              segment: { index: index + 1, total: chunks.length },
+            });
+            await this.playAudio(audioUrl, run);
+            if (token !== this.token || run.aborted) return;
+
+            if (index + 1 >= chunks.length) break;
+
+            this.publish({
+              status: 'loading',
+              messageId,
+              error: null,
+              segment: { index: index + 2, total: chunks.length },
+            });
+            const next = await nextPromise;
+            if (token !== this.token || run.aborted) return;
+            if (next.error) {
+              run.index = index + 1;
+              throw next.error;
+            }
+            audioUrl = next.url;
           }
-          const type = response.headers.get('content-type') ?? '';
-          if (!type.includes('audio') && !type.includes('octet-stream')) {
-            const error = new Error('The read-aloud service returned an unexpected response');
-            error.code = 'tts-failed';
-            throw error;
-          }
-          const blob = await response.blob();
-          if (token !== this.token) return;
-          if (blob.size === 0) {
-            const error = new Error('The read-aloud service returned empty audio');
-            error.code = 'tts-failed';
-            throw error;
-          }
-          const url = URL.createObjectURL(blob);
-          this.cache.set(messageId, url);
-          this.trimCache(messageId);
-          await this.startAudio(url, messageId, token);
+
+          this.run = null;
+          this.trimCache();
+          this.publish({ status: 'idle', messageId: null, error: null, segment: null });
         } catch (error) {
+          run.aborted = true;
+          run.controller.abort();
+          this.run = null;
+          this.audio = null;
+          this.trimCache();
+
           if (token !== this.token || error?.name === 'AbortError') return;
           const normalised = {
             code: error?.code ?? (error?.name === 'TypeError' ? 'network' : 'tts-failed'),
             message: error?.message ?? String(error),
           };
-          this.publish({ status: 'error', messageId, error: normalised });
-        } finally {
-          if (this.fetchController === controller) this.fetchController = null;
-        }
-      }
-
-      async startAudio(url, messageId, token) {
-        if (token !== this.token) return;
-        const audio = new Audio(url);
-        this.audio = audio;
-        audio.onended = () => {
-          if (token !== this.token) return;
-          this.audio = null;
-          this.publish({ status: 'idle', messageId: null, error: null });
-        };
-        audio.onerror = () => {
-          if (token !== this.token) return;
-          this.audio = null;
           this.publish({
             status: 'error',
             messageId,
-            error: { code: 'audio', message: '' },
-          });
-        };
-        try {
-          await audio.play();
-          if (token !== this.token) return;
-          this.publish({ status: 'playing', messageId, error: null });
-        } catch (error) {
-          if (token !== this.token) return;
-          this.audio = null;
-          this.publish({
-            status: 'error',
-            messageId,
-            error: {
-              code: 'audio',
-              message: error?.message ?? 'The browser blocked audio playback',
-            },
+            error: normalised,
+            segment: { index: Math.min(run.index + 1, chunks.length), total: chunks.length },
           });
         }
       }
@@ -694,9 +841,9 @@ window.__ModuleLoader__.load({
       }
 
       dispose() {
+        this.listeners.clear();
         this.stop();
         this.clearCache();
-        this.listeners.clear();
       }
     }
 
@@ -753,7 +900,6 @@ window.__ModuleLoader__.load({
     function ReadAloudAction({ messageId, t, useChat, controller }) {
       const rawText = useChat((snapshot) => findAssistantText(snapshot, messageId));
       const text = React.useMemo(() => prepareSpeech(rawText), [rawText]);
-      const long = React.useMemo(() => (rawText?.length ?? 0) > 4000, [rawText]);
       const [state, setState] = React.useState(() => controller.getState());
 
       React.useEffect(() => {
@@ -766,12 +912,19 @@ window.__ModuleLoader__.load({
       const active = state.messageId === messageId;
       const status = active ? state.status : 'idle';
       const error = active ? state.error : null;
+      const segment = active ? state.segment : null;
+      const segmentLabel = segment && segment.total > 1
+        ? t('actionSegment', { current: segment.index, total: segment.total })
+        : '';
       const disabled = text.length === 0;
 
       let label;
       if (disabled) label = t('actionNoText');
-      else if (status === 'loading') label = t('actionSynthesizing');
-      else if (status === 'playing') label = t('actionStop');
+      else if (status === 'loading') {
+        label = segmentLabel
+          ? t('actionSynthesizingSegment', { current: segment.index, total: segment.total })
+          : t('actionSynthesizing');
+      } else if (status === 'playing') label = t('actionStop');
       else if (status === 'error') label = t('actionRetry');
       else label = t('actionRead');
 
@@ -779,8 +932,8 @@ window.__ModuleLoader__.load({
       if (error) {
         const detail = errorDetail(error);
         title = `${errorCopy(t, error)}${detail ? ` — ${detail}` : ''}`;
-      } else if (long && status === 'idle') {
-        title = `${title} · ${t('actionLong')}`;
+      } else if (status === 'playing' && segmentLabel) {
+        title = `${label} · ${segmentLabel}`;
       }
 
       return h(
