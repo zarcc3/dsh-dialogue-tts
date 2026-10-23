@@ -61,9 +61,11 @@ Host 端通过 `POST /plugin-api/dialogue-tts/stream` 接收文本，再以流�
   "text_split_method": "cut5",
   "speed_factor": 1,
   "media_type": "wav",
-  "streaming_mode": 2
+  "streaming_mode": 1
 }
 ```
+
+`streaming_mode: 1` 是 GPT-SoVITS 的最高质量流式模式，首块延迟比模式 2/3 稍高。
 
 GPT-SoVITS 返回 WAV 头加持续 PCM 数据，Host 直接转发，浏览器用 Web Audio 解析并连续调度播放。
 

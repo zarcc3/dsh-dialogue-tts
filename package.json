@@ -1,6 +1,6 @@
 {
   "name": "@local/dialogue-tts",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "description": "Stream assistant replies aloud with a local GPT-SoVITS voice and a configurable reference voice.",
   "type": "module",

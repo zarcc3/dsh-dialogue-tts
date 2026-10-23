@@ -19,7 +19,8 @@ const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 const PROMPT_LANGS = new Set(['zh', 'en', 'ja', 'ko', 'yue']);
 const TEXT_LANGS = new Set(['auto', 'zh', 'en', 'ja', 'ko', 'yue']);
 const STREAM_TEXT_LIMIT = 20000;
-const STREAMING_MODE = 2;
+// 1 = best quality / slowest response, 2 = medium, 3 = fastest / lower quality.
+const STREAMING_MODE = 1;
 
 const DEFAULT_SETTINGS = Object.freeze({
   serverUrl: 'http://127.0.0.1:9880',
