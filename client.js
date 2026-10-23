@@ -37,6 +37,8 @@ window.__ModuleLoader__.load({
       promptLangLabel: '参考音频语言',
       textLangLabel: '朗读语言',
       speedLabel: '语速',
+      autoPlayTitle: '自动播放新回复',
+      autoPlayHint: '开启后，当前对话中新完成的助手回复会自动分段朗读；默认关闭。',
       test: '试听参考语音',
       testing: '正在合成试听…',
       stopTest: '停止试听',
@@ -95,6 +97,8 @@ window.__ModuleLoader__.load({
       promptLangLabel: 'Reference language',
       textLangLabel: 'Reading language',
       speedLabel: 'Speed',
+      autoPlayTitle: 'Auto-play new replies',
+      autoPlayHint: 'When enabled, newly completed assistant replies in the current conversation are read aloud in segments. Off by default.',
       test: 'Preview reference voice',
       testing: 'Synthesizing preview…',
       stopTest: 'Stop preview',
@@ -285,6 +289,43 @@ window.__ModuleLoader__.load({
       .dtts-fileState[data-tone="ok"] { color: var(--dsw-alias-state-success-primary); }
       .dtts-fileState[data-tone="error"] { color: var(--dsw-alias-state-error-primary); }
       .dtts-range { width: 100%; accent-color: var(--dsw-alias-brand-primary); }
+      .dtts-toggleRow { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+      .dtts-toggleCopy { min-width: 0; }
+      .dtts-switch {
+        position: relative;
+        flex: none;
+        width: 38px;
+        height: 22px;
+        padding: 0;
+        border: 1px solid var(--dsw-alias-border-l2);
+        border-radius: 999px;
+        background: var(--dsw-alias-bg-layer-2);
+        cursor: pointer;
+        transition: background-color .12s, border-color .12s;
+      }
+      .dtts-switch[data-on="true"] {
+        background: var(--dsw-alias-brand-primary);
+        border-color: var(--dsw-alias-brand-primary);
+      }
+      .dtts-switchThumb {
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--dsw-alias-label-primary);
+        transition: transform .12s, background-color .12s;
+      }
+      .dtts-switch[data-on="true"] .dtts-switchThumb {
+        transform: translateX(16px);
+        background: var(--dsw-alias-bg-base);
+      }
+      .dtts-switch:focus-visible {
+        outline: 2px solid var(--dsw-alias-brand-primary);
+        outline-offset: 2px;
+      }
+      .dtts-switch:disabled { opacity: .45; cursor: default; }
 
       .dtts-actions {
         display: flex;
@@ -353,7 +394,7 @@ window.__ModuleLoader__.load({
         .dtts-grid { grid-template-columns: minmax(0, 1fr); }
       }
       @media (prefers-reduced-motion: reduce) {
-        .dtts-action, .dtts-primary, .dtts-secondary, .dtts-input, .dtts-select, .dtts-textarea { transition: none; }
+        .dtts-action, .dtts-primary, .dtts-secondary, .dtts-input, .dtts-select, .dtts-textarea, .dtts-switch, .dtts-switchThumb { transition: none; }
         .dtts-spin, .dtts-dot[data-phase="checking"] { animation: none; }
       }
     `;
@@ -484,6 +525,26 @@ window.__ModuleLoader__.load({
         }
       }
       return fallback;
+    }
+
+    function findLatestAssistantId(snapshot) {
+      const nodes = snapshot?.nodes;
+      if (!nodes || typeof nodes.values !== 'function') return '';
+      let latestId = '';
+      let latestSeq = -1;
+      for (const node of nodes.values()) {
+        if (!node || node.kind !== 'turn-tail') continue;
+        const closing = node.data?.closing;
+        const messageId = closing?.finalNode?.messageId;
+        if (!messageId) continue;
+        if (!textOfBlocks(closing.blocks).trim()) continue;
+        const seq = closing.finalNode.seq ?? node.data?.seq ?? 0;
+        if (seq >= latestSeq) {
+          latestSeq = seq;
+          latestId = messageId;
+        }
+      }
+      return latestId;
     }
 
     function prepareSpeech(markdown) {
@@ -855,6 +916,49 @@ window.__ModuleLoader__.load({
       }
     }
 
+    class VoicePreferences {
+      constructor() {
+        this.state = { autoPlay: false, loaded: false };
+        this.listeners = new Set();
+        this.loading = null;
+      }
+
+      getState = () => this.state;
+
+      subscribe = (listener) => {
+        this.listeners.add(listener);
+        return () => {
+          this.listeners.delete(listener);
+        };
+      };
+
+      publish(next) {
+        if (this.state.autoPlay === next.autoPlay && this.state.loaded === next.loaded) return;
+        this.state = next;
+        for (const listener of this.listeners) listener();
+      }
+
+      set(settings) {
+        this.publish({ autoPlay: settings?.autoPlay === true, loaded: true });
+      }
+
+      async ensureLoaded() {
+        if (this.state.loaded) return;
+        if (this.loading !== null) return this.loading;
+        this.loading = (async () => {
+          try {
+            const data = await api.load();
+            if (!this.state.loaded) this.set(data.settings);
+          } catch {
+            // Leave the preference unloaded; the settings page can retry.
+          } finally {
+            this.loading = null;
+          }
+        })();
+        return this.loading;
+      }
+    }
+
     function SpeakerIcon() {
       return h(
         'svg',
@@ -976,9 +1080,24 @@ window.__ModuleLoader__.load({
 
     /**
      * Invisible session-scoped guard: stop speech that belongs to another
-     * conversation as soon as the visible Session changes.
+     * conversation, and auto-play newly completed replies when enabled.
      */
-    function SessionPlaybackGuard({ sessionId, controller }) {
+    function SessionPlaybackGuard({ sessionId, controller, useChat, useSession, preferences }) {
+      const latestId = useChat((snapshot) => findLatestAssistantId(snapshot));
+      const latestText = useChat((snapshot) => latestId ? findAssistantText(snapshot, latestId) : '');
+      const openState = useSession((snapshot) => snapshot?.openState);
+      const [prefs, setPrefs] = React.useState(() => preferences.getState());
+      const seenRef = React.useRef(latestId || null);
+      const prevAutoRef = React.useRef(false);
+
+      React.useEffect(() => {
+        const sync = () => setPrefs(preferences.getState());
+        const unsubscribe = preferences.subscribe(sync);
+        void preferences.ensureLoaded();
+        sync();
+        return unsubscribe;
+      }, [preferences]);
+
       React.useEffect(() => {
         const stopForOtherSession = () => {
           const active = controller.getState().sessionId;
@@ -989,6 +1108,36 @@ window.__ModuleLoader__.load({
         stopForOtherSession();
         return controller.subscribe(stopForOtherSession);
       }, [controller, sessionId]);
+
+      React.useEffect(() => {
+        if (!prefs.loaded || openState !== 'open') {
+          seenRef.current = latestId || null;
+          prevAutoRef.current = false;
+          return;
+        }
+        if (!prefs.autoPlay) {
+          seenRef.current = latestId || null;
+          prevAutoRef.current = false;
+          return;
+        }
+        if (!prevAutoRef.current) {
+          // Turning auto-play on, or opening a conversation, establishes a
+          // baseline so existing history is not read unexpectedly.
+          seenRef.current = latestId || null;
+          prevAutoRef.current = true;
+          return;
+        }
+        if (!latestId) {
+          seenRef.current = null;
+          return;
+        }
+        if (seenRef.current === latestId) return;
+
+        seenRef.current = latestId;
+        const speech = prepareSpeech(latestText);
+        if (speech) void controller.play(latestId, speech, sessionId);
+      }, [prefs.loaded, prefs.autoPlay, openState, latestId, latestText, sessionId, controller]);
+
       return null;
     }
 
@@ -998,7 +1147,7 @@ window.__ModuleLoader__.load({
       return { phase: 'ok', message: '' };
     }
 
-    function TtsSettings({ t, api, controller }) {
+    function TtsSettings({ t, api, controller, preferences }) {
       const [form, setForm] = React.useState(null);
       const [defaults, setDefaults] = React.useState(null);
       const [initial, setInitial] = React.useState(null);
@@ -1043,6 +1192,7 @@ window.__ModuleLoader__.load({
             setInitial(data.settings);
             setDefaults(data.defaults);
             setRefInfo(data.ref);
+            preferences.set(data.settings);
             try {
               const probe = await api.probe(data.settings);
               if (cancelled) return;
@@ -1158,6 +1308,7 @@ window.__ModuleLoader__.load({
           setInitial(result.settings);
           setDefaults(result.defaults ?? defaults);
           setRefInfo(result.ref);
+          preferences.set(result.settings);
           setNotice({ tone: 'success', text: t('saved') });
           controller.stop();
           controller.clearCache();
@@ -1343,6 +1494,35 @@ window.__ModuleLoader__.load({
           { className: 'dtts-card' },
           h(
             'div',
+            { className: 'dtts-toggleRow' },
+            h(
+              'div',
+              { className: 'dtts-toggleCopy' },
+              h('div', { className: 'dtts-cardTitle' }, t('autoPlayTitle')),
+              h('div', { className: 'dtts-cardHint' }, t('autoPlayHint')),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                role: 'switch',
+                className: 'dtts-switch',
+                'data-on': form.autoPlay === true ? 'true' : undefined,
+                'aria-checked': form.autoPlay === true,
+                'aria-label': t('autoPlayTitle'),
+                disabled: fieldsDisabled,
+                onClick: () => update('autoPlay', form.autoPlay !== true),
+              },
+              h('span', { className: 'dtts-switchThumb', 'aria-hidden': 'true' }),
+            ),
+          ),
+        ),
+
+        h(
+          'div',
+          { className: 'dtts-card' },
+          h(
+            'div',
             { className: 'dtts-cardHead' },
             h(
               'div',
@@ -1510,6 +1690,7 @@ window.__ModuleLoader__.load({
       }, 'dialogue-tts: styles');
 
       const controller = new PlaybackController();
+      const preferences = new VoicePreferences();
       ctx.effect(() => () => controller.dispose(), 'dialogue-tts: playback');
 
       ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
@@ -1517,7 +1698,7 @@ window.__ModuleLoader__.load({
         id: 'dialogue-tts-session-guard',
         order: -100,
         locale: NS,
-        inject: () => ({ controller }),
+        inject: () => ({ controller, preferences }),
       }, SessionPlaybackGuard));
 
       ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
@@ -1534,7 +1715,7 @@ window.__ModuleLoader__.load({
         order: 35,
         label: () => t('nav'),
         locale: NS,
-        inject: () => ({ api, controller }),
+        inject: () => ({ api, controller, preferences }),
       }, TtsSettings));
     }
 

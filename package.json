@@ -1,6 +1,6 @@
 {
   "name": "@local/dialogue-tts",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "private": true,
   "description": "Read assistant replies aloud with a local GPT-SoVITS voice and a configurable reference voice.",
   "type": "module",

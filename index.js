@@ -24,6 +24,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   promptLang: 'zh',
   textLang: 'zh',
   speed: 1,
+  autoPlay: false,
 });
 
 /** Rejection carrying an HTTP status and a stable client-facing code. */
@@ -92,6 +93,7 @@ function normalizeSettings(input, base = DEFAULT_SETTINGS) {
     promptLang,
     textLang,
     speed: Math.round(speedValue * 100) / 100,
+    autoPlay: pick('autoPlay') === true,
   };
 }
 
