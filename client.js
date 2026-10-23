@@ -815,13 +815,14 @@ window.__ModuleLoader__.load({
           this.trimCache();
           this.publish({ status: 'idle', messageId: null, error: null, segment: null });
         } catch (error) {
+          if (token !== this.token) return;
           run.aborted = true;
           run.controller.abort();
-          this.run = null;
+          if (this.run === run) this.run = null;
           this.audio = null;
           this.trimCache();
 
-          if (token !== this.token || error?.name === 'AbortError') return;
+          if (error?.name === 'AbortError') return;
           const normalised = {
             code: error?.code ?? (error?.name === 'TypeError' ? 'network' : 'tts-failed'),
             message: error?.message ?? String(error),
