@@ -554,7 +554,7 @@ window.__ModuleLoader__.load({
 
     class PlaybackController {
       constructor() {
-        this.state = { status: 'idle', messageId: null, error: null, segment: null };
+        this.state = { status: 'idle', messageId: null, sessionId: null, error: null, segment: null };
         this.listeners = new Set();
         this.audio = null;
         this.run = null;
@@ -607,7 +607,7 @@ window.__ModuleLoader__.load({
       stop() {
         this.token += 1;
         this.releaseRun();
-        this.publish({ status: 'idle', messageId: null, error: null, segment: null });
+        this.publish({ status: 'idle', messageId: null, sessionId: null, error: null, segment: null });
       }
 
       async fetchChunk(run, index) {
@@ -722,7 +722,7 @@ window.__ModuleLoader__.load({
         });
       }
 
-      async play(messageId, text) {
+      async play(messageId, text, sessionId = null) {
         const current = this.state;
         if (current.messageId === messageId && (current.status === 'loading' || current.status === 'playing')) {
           this.stop();
@@ -737,6 +737,7 @@ window.__ModuleLoader__.load({
           this.publish({
             status: 'error',
             messageId,
+            sessionId,
             error: { code: 'empty-text', message: '' },
             segment: null,
           });
@@ -748,6 +749,7 @@ window.__ModuleLoader__.load({
           this.publish({
             status: 'error',
             messageId,
+            sessionId,
             error: { code: 'empty-text', message: '' },
             segment: null,
           });
@@ -757,6 +759,7 @@ window.__ModuleLoader__.load({
         const run = {
           token,
           messageId,
+          sessionId,
           chunks,
           index: 0,
           controller: new AbortController(),
@@ -767,6 +770,7 @@ window.__ModuleLoader__.load({
         this.publish({
           status: 'loading',
           messageId,
+          sessionId,
           error: null,
           segment: { index: 1, total: chunks.length },
         });
@@ -788,6 +792,7 @@ window.__ModuleLoader__.load({
             this.publish({
               status: 'playing',
               messageId,
+              sessionId,
               error: null,
               segment: { index: index + 1, total: chunks.length },
             });
@@ -799,6 +804,7 @@ window.__ModuleLoader__.load({
             this.publish({
               status: 'loading',
               messageId,
+              sessionId,
               error: null,
               segment: { index: index + 2, total: chunks.length },
             });
@@ -813,7 +819,7 @@ window.__ModuleLoader__.load({
 
           this.run = null;
           this.trimCache();
-          this.publish({ status: 'idle', messageId: null, error: null, segment: null });
+          this.publish({ status: 'idle', messageId: null, sessionId: null, error: null, segment: null });
         } catch (error) {
           if (token !== this.token) return;
           run.aborted = true;
@@ -830,6 +836,7 @@ window.__ModuleLoader__.load({
           this.publish({
             status: 'error',
             messageId,
+            sessionId,
             error: normalised,
             segment: { index: Math.min(run.index + 1, chunks.length), total: chunks.length },
           });
@@ -898,7 +905,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function ReadAloudAction({ messageId, t, useChat, controller }) {
+    function ReadAloudAction({ messageId, sessionId, t, useChat, controller }) {
       const rawText = useChat((snapshot) => findAssistantText(snapshot, messageId));
       const text = React.useMemo(() => prepareSpeech(rawText), [rawText]);
       const [state, setState] = React.useState(() => controller.getState());
@@ -953,7 +960,7 @@ window.__ModuleLoader__.load({
             disabled,
             onClick: () => {
               if (disabled) return;
-              void controller.play(messageId, text);
+              void controller.play(messageId, text, sessionId);
             },
           },
           status === 'loading'
@@ -965,6 +972,24 @@ window.__ModuleLoader__.load({
         ),
         error ? h('span', { className: 'dtts-sr', role: 'alert' }, title) : null,
       );
+    }
+
+    /**
+     * Invisible session-scoped guard: stop speech that belongs to another
+     * conversation as soon as the visible Session changes.
+     */
+    function SessionPlaybackGuard({ sessionId, controller }) {
+      React.useEffect(() => {
+        const stopForOtherSession = () => {
+          const active = controller.getState().sessionId;
+          if (active !== null && active !== undefined && active !== sessionId) {
+            controller.stop();
+          }
+        };
+        stopForOtherSession();
+        return controller.subscribe(stopForOtherSession);
+      }, [controller, sessionId]);
+      return null;
     }
 
     function serverPhase(server) {
@@ -1486,6 +1511,14 @@ window.__ModuleLoader__.load({
 
       const controller = new PlaybackController();
       ctx.effect(() => () => controller.dispose(), 'dialogue-tts: playback');
+
+      ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+        name: 'conversation.composer.dock',
+        id: 'dialogue-tts-session-guard',
+        order: -100,
+        locale: NS,
+        inject: () => ({ controller }),
+      }, SessionPlaybackGuard));
 
       ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
         name: 'conversation.chat.assistant-actions',
