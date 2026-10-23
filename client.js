@@ -1086,9 +1086,11 @@ window.__ModuleLoader__.load({
       const latestId = useChat((snapshot) => findLatestAssistantId(snapshot));
       const latestText = useChat((snapshot) => latestId ? findAssistantText(snapshot, latestId) : '');
       const openState = useSession((snapshot) => snapshot?.openState);
+      const running = useSession((snapshot) => snapshot?.running === true);
       const [prefs, setPrefs] = React.useState(() => preferences.getState());
       const seenRef = React.useRef(latestId || null);
       const prevAutoRef = React.useRef(false);
+      const wasRunningRef = React.useRef(false);
 
       React.useEffect(() => {
         const sync = () => setPrefs(preferences.getState());
@@ -1108,6 +1110,15 @@ window.__ModuleLoader__.load({
         stopForOtherSession();
         return controller.subscribe(stopForOtherSession);
       }, [controller, sessionId]);
+
+      React.useEffect(() => {
+        const wasRunning = wasRunningRef.current;
+        wasRunningRef.current = running;
+        if (running && !wasRunning && prefs.autoPlay) {
+          const active = controller.getState();
+          if (active.status !== 'idle') controller.stop();
+        }
+      }, [running, prefs.autoPlay, controller]);
 
       React.useEffect(() => {
         if (!prefs.loaded || openState !== 'open') {
