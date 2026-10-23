@@ -2,6 +2,8 @@ import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 /** Browser API prefix owned by this bundle. */
 const API_ROOT = '/plugin-api/dialogue-tts';
@@ -16,6 +18,8 @@ const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 
 const PROMPT_LANGS = new Set(['zh', 'en', 'ja', 'ko', 'yue']);
 const TEXT_LANGS = new Set(['auto', 'zh', 'en', 'ja', 'ko', 'yue']);
+const STREAM_TEXT_LIMIT = 20000;
+const STREAMING_MODE = 2;
 
 const DEFAULT_SETTINGS = Object.freeze({
   serverUrl: 'http://127.0.0.1:9880',
@@ -299,6 +303,103 @@ function sendAudio(response, result) {
   response.end(result.audio);
 }
 
+async function streamSynthesis(settings, text, response) {
+  if (!settings.refAudioPath) {
+    throw new HttpError(400, 'not-configured', 'configure a reference audio path first');
+  }
+  const ref = await describeRef(settings.refAudioPath);
+  if (!ref.exists) {
+    throw new HttpError(400, 'ref-missing', `reference audio not found: ${settings.refAudioPath}`);
+  }
+  const trimmed = typeof text === 'string' ? text.trim() : '';
+  if (!trimmed) {
+    throw new HttpError(400, 'empty-text', 'there is no text to read');
+  }
+  if (trimmed.length > STREAM_TEXT_LIMIT) {
+    throw new HttpError(400, 'text-too-long', `text exceeds ${STREAM_TEXT_LIMIT} characters`);
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const headerTimer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, 60000);
+
+  let upstream;
+  try {
+    upstream = await fetch(endpoint(settings.serverUrl, 'tts'), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'audio/wav, application/json',
+      },
+      body: JSON.stringify({
+        text: trimmed,
+        text_lang: settings.textLang,
+        ref_audio_path: settings.refAudioPath,
+        prompt_text: settings.promptText,
+        prompt_lang: settings.promptLang,
+        text_split_method: 'cut5',
+        batch_size: 1,
+        speed_factor: settings.speed,
+        media_type: 'wav',
+        streaming_mode: STREAMING_MODE,
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(headerTimer);
+    if (timedOut) {
+      throw new HttpError(504, 'tts-timeout', 'GPT-SoVITS did not start streaming within 60 seconds');
+    }
+    throw new HttpError(502, 'unreachable', error?.cause?.code ?? error?.message ?? 'cannot reach GPT-SoVITS');
+  }
+  clearTimeout(headerTimer);
+
+  if (!upstream.ok) {
+    throw new HttpError(502, 'tts-failed', await upstreamError(upstream));
+  }
+  if (!upstream.body) {
+    throw new HttpError(502, 'tts-failed', 'GPT-SoVITS returned no audio stream');
+  }
+
+  response.writeHead(200, {
+    'content-type': upstream.headers.get('content-type') ?? 'audio/wav',
+    'cache-control': 'no-store',
+    'x-dialogue-tts-provider': 'gpt-sovits',
+    'x-accel-buffering': 'no',
+  });
+
+  const onClose = () => {
+    if (!response.writableEnded) controller.abort();
+  };
+  response.on('close', onClose);
+
+  try {
+    await pipeline(Readable.fromWeb(upstream.body), response);
+  } catch (error) {
+    if (response.headersSent) {
+      response.destroy(error);
+      return;
+    }
+    throw error;
+  } finally {
+    response.off('close', onClose);
+    controller.abort();
+  }
+}
+
+async function handleStream(request, response) {
+  if (request.method !== 'POST') {
+    methodNotAllowed(response, 'POST');
+    return;
+  }
+  const body = await readJsonBody(request);
+  const settings = await loadSettings();
+  await streamSynthesis(settings, body?.text, response);
+}
+
 async function handleSettings(request, response) {
   if (request.method === 'GET') {
     const settings = await loadSettings();
@@ -372,6 +473,7 @@ export function apply(ctx) {
     { path: `${API_ROOT}/probe`, handler: guarded(handleProbe) },
     { path: `${API_ROOT}/preview`, handler: guarded(handlePreview) },
     { path: `${API_ROOT}/tts`, handler: guarded(handleTts) },
+    { path: `${API_ROOT}/stream`, handler: guarded(handleStream) },
   ];
   ctx.effect(() => {
     const disposers = routes.map((route) => ctx.webServer.register({

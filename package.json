@@ -1,8 +1,8 @@
 {
   "name": "@local/dialogue-tts",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "private": true,
-  "description": "Read assistant replies aloud with a local GPT-SoVITS voice and a configurable reference voice.",
+  "description": "Stream assistant replies aloud with a local GPT-SoVITS voice and a configurable reference voice.",
   "type": "module",
   "exports": {
     ".": "./index.js",

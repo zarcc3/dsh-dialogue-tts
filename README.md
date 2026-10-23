@@ -4,9 +4,9 @@
 
 ## 功能
 
-- 每条已完成的助手回复下方增加一个喇叭按钮：点击合成并播放，再次点击停止。
-- 长文本按约 400 字自动分段，优先在句子边界切分；当前段播放时预取下一段，然后依次排队播放。
-- 设置中可开启“自动播放新回复”：当前对话中新完成的助手回复会自动朗读；开始生成新回复时会立即停止上一条回复的语音。默认关闭。
+- 每条已完成的助手回复下方增加一个喇叭按钮：点击开始流式播放，再次点击停止。
+- 使用 GPT-SoVITS 的流式输出，边生成边通过 Web Audio 播放；不再按 400 字分段请求。
+- 设置中可开启“自动播放新回复”：当前对话中新完成的助手回复会自动流式播放；开始生成新回复时会立即停止上一条回复的语音。默认关闭。
 - 切换或新建对话时，自动停止上一个会话的语音播放。
 - “设置 → 朗读对话”提供完整配置：
   - GPT-SoVITS 服务地址
@@ -15,7 +15,7 @@
   - 朗读语言与语速
   - 连接检测、参考文件检查、试听与保存
 - 设置持久化到 `%DSH_HOME%/plugin-data/dialogue-tts/settings.json`，不会写入插件仓库。
-- 合成音频按消息分段缓存在当前页面内；保存新参考语音后会清空缓存。
+- 流式音频只在内存中播放，不写入磁盘，也不做播放缓存。
 
 ## 默认配置
 
@@ -49,7 +49,7 @@ git clone git@github.com:zarcc3/dsh-dialogue-tts.git
 
 ## GPT-SoVITS 接口
 
-Host 端以 `POST {serverUrl}/tts` 调用 GPT-SoVITS，请求字段包括：
+Host 端通过 `POST /plugin-api/dialogue-tts/stream` 接收文本，再以流式方式请求 GPT-SoVITS：
 
 ```json
 {
@@ -59,9 +59,13 @@ Host 端以 `POST {serverUrl}/tts` 调用 GPT-SoVITS，请求字段包括：
   "prompt_text": "参考音频里说出的文字",
   "prompt_lang": "zh",
   "text_split_method": "cut5",
-  "speed_factor": 1
+  "speed_factor": 1,
+  "media_type": "wav",
+  "streaming_mode": 2
 }
 ```
+
+GPT-SoVITS 返回 WAV 头加持续 PCM 数据，Host 直接转发，浏览器用 Web Audio 解析并连续调度播放。
 
 ## 配置与隐私
 
@@ -71,13 +75,18 @@ Host 端以 `POST {serverUrl}/tts` 调用 GPT-SoVITS，请求字段包括：
 
 ## 实现
 
-- Host 端（`index.js`）注册同源 HTTP 路由，负责设置读写、服务探测、参考文件检查与音频代理。
+- Host 端（`index.js`）注册同源 HTTP 路由，负责设置读写、服务探测、参考文件检查与流式音频代理。
 - Client 端（`client.js`）注册：
   - `conversation.chat.assistant-actions`：每条助手回复的朗读按钮。
   - `settings.section`：设置页面。
+  - `conversation.composer.dock`：自动播放与会话切换守卫。
+- 浏览器解析流式 WAV 头，并把后续 PCM 块调度到 Web Audio。
 
 ## 已知限制
 
-- 长文本按约 400 字分段，每段一次合成请求；如果 GPT-SoVITS 合成速度慢于播放速度，段与段之间会出现等待。
+- 流式播放依赖浏览器的 Web Audio API；自动播放是否可用取决于浏览器/Electron 的音频播放策略。
+- 流式请求中断时，已经缓冲的播放会立即停止并显示错误。
+- 流式音频不缓存，重复播放会重新请求 GPT-SoVITS。
+- 单次流式朗读文本上限为 20,000 字。
 - 只朗读助手回复中的正文文本块；代码块和 Markdown 标记会被清理，不朗读。
 - 参考音频必须能被运行 GPT-SoVITS 的进程读取；浏览器不会上传或读取该文件。
