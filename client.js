@@ -509,10 +509,10 @@ window.__ModuleLoader__.load({
 
     /**
      * Split cleaned speech into request-sized pieces, preferring sentence ends.
-     * The 600-character default keeps each GPT-SoVITS request small enough to
+     * The 400-character default keeps each GPT-SoVITS request small enough to
      * start playing while the following piece is synthesized.
      */
-    function splitSpeechText(text, maxChars = 600) {
+    function splitSpeechText(text, maxChars = 400) {
       const source = typeof text === 'string' ? text.trim() : '';
       if (!source) return [];
       if (source.length <= maxChars) return [source];
